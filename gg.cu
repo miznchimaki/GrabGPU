@@ -1,3 +1,7 @@
+// Based on miznchimaki/GrabGPU gg.cu, blob cc2c225f8bfb62fd94953548310b17acf5015d3c.
+// CLI update: named options, help, and literal arguments for real shell scripts.
+// Build: nvcc -std=c++11 -arch=sm_80 gg.cu -o gg  (A100 example)
+
 #include <iostream>
 #include <vector>
 #include <string>
@@ -7,6 +11,14 @@
 #include <thread>
 #include <cmath>
 #include <cstring>
+#include <cerrno>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <stdexcept>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <mma.h>
 #include <cuda_fp16.h>
 
@@ -25,7 +37,209 @@ using namespace nvcuda;
   } while (0)
 
 const double bytes_per_gb = 1024.0 * 1024.0 * 1024.0;
-const int max_gpu_num = 32;
+// ============================================================================
+// Command line. Parsing and --help do not initialize CUDA.
+// This is a GPU workload/reservation utility, not a model-training program.
+// ============================================================================
+
+struct Options {
+  size_t occupy_size = 0;
+  float total_time = 0.0f;
+  float utilization = 0.0f;  // Set by the required --arg4; no CLI default.
+  std::vector<int> gpu_ids;
+  bool all_gpus = false;
+  std::string script_path;
+  std::vector<std::string> script_args;
+};
+
+static void print_help(const char* program) {
+  std::cout
+      << "GrabGPU - Tensor Core workload / GPU reservation utility\n\n"
+      << "Usage:\n  " << program
+      << " [--script PATH] [--NAME VALUE ...]\n"
+      << "      --arg1 GIB --arg2 HOURS --arg3 GPU_IDS --arg4 FRACTION\n\n"
+      << "The last four pairs are required, in exactly the order shown:\n"
+      << "  --arg1 GIB       GPU memory to allocate per device, in GiB (> 0).\n"
+      << "  --arg2 HOURS     Built-in workload duration in hours (>= 0).\n"
+      << "                   0 runs one duty-cycle iteration after calibration.\n"
+      << "  --arg3 GPU_IDS   CUDA-visible IDs, e.g. 0 or 0,1; -1 = all visible GPUs.\n"
+      << "  --arg4 FRACTION Target duty fraction in (0, 1]; required, no default.\n\n"
+      << "Options before those last four pairs:\n"
+      << "  --script PATH   Run a real shell script using /bin/sh after allocation\n"
+      << "                  succeeds and the reserved buffers are released.\n"
+      << "  --NAME VALUE    Forward this pair verbatim to --script as arguments.\n"
+      << "                  Any number of these pairs is allowed. They require\n"
+      << "                  --script and are not consumed by the built-in kernel.\n"
+      << "                  Training defaults belong to the actual script.\n"
+      << "  --help, -h, help\n"
+      << "                  Show this help without initializing CUDA.\n\n"
+      << "All value-taking options use --name value (not --name=value).\n"
+      << "Quote values containing spaces. Values cannot start with '--'.\n"
+      << "The names arg1, arg2, arg3, arg4, script and help are reserved.\n"
+      << "The old --utilization option has been replaced by required --arg4.\n"
+      << "GPU IDs are relative to CUDA_VISIBLE_DEVICES when it is set.\n"
+      << "Script mode inherits CUDA_VISIBLE_DEVICES unchanged. --arg3 only\n"
+      << "selects devices for the reservation; the script selects its own GPUs.\n"
+      << "In script mode, HOURS and utilization do not limit the script.\n"
+      << "Releasing the buffers before the script starts is not an atomic handoff.\n"
+      << "Only arguments actually passed at launch appear in the command line;\n"
+      << "internal defaults are not inserted into process arguments.\n\n"
+      << "Examples:\n  " << program
+      << " --arg1 16 --arg2 24 --arg3 0,1 --arg4 0.5\n  " << program
+      << " --arg1 16 --arg2 24 --arg3 0 --arg4 0.6\n  " << program
+      << " --script run.sh --epochs 10 --batch-size 64 --lr 1e-4"
+      << " --arg1 16 --arg2 24 --arg3 0,1 --arg4 0.5\n\n"
+      << "run.sh must read or forward its arguments (for example, with \"$@\").\n"
+      << "No model, dataset, training loop or training defaults are built in.\n";
+}
+
+static double parse_number(const std::string& value, const char* name) {
+  if (value.empty() ||
+      std::isspace(static_cast<unsigned char>(value.front()))) {
+    throw std::invalid_argument(std::string(name) + " requires a number");
+  }
+  errno = 0;
+  char* end = nullptr;
+  const double result = std::strtod(value.c_str(), &end);
+  if (errno == ERANGE || end == value.c_str() || *end != '\0' ||
+      !std::isfinite(result)) {
+    throw std::invalid_argument(std::string(name) +
+                                " requires a finite number: " + value);
+  }
+  return result;
+}
+
+static std::vector<int> parse_gpu_ids(const std::string& value,
+                                      bool& all_gpus) {
+  all_gpus = (value == "-1");
+  if (all_gpus) return std::vector<int>();
+  if (value.empty() || value.back() == ',') {
+    throw std::invalid_argument("--arg3 requires GPU IDs such as 0 or 0,1");
+  }
+  std::vector<int> ids;
+  std::stringstream stream(value);
+  std::string token;
+  while (std::getline(stream, token, ',')) {
+    if (token.empty()) {
+      throw std::invalid_argument("--arg3 contains an empty GPU ID");
+    }
+    int id = 0;
+    for (char ch : token) {
+      if (ch < '0' || ch > '9') {
+        throw std::invalid_argument("--arg3 has invalid GPU ID: " + token);
+      }
+      const int digit = ch - '0';
+      if (id > (std::numeric_limits<int>::max() - digit) / 10) {
+        throw std::invalid_argument("--arg3 GPU ID is too large: " + token);
+      }
+      id = id * 10 + digit;
+    }
+    if (std::find(ids.begin(), ids.end(), id) != ids.end()) {
+      throw std::invalid_argument("--arg3 has duplicate GPU ID: " + token);
+    }
+    ids.push_back(id);
+  }
+  if (ids.empty()) {
+    throw std::invalid_argument("--arg3 must select at least one GPU");
+  }
+  return ids;
+}
+
+static bool is_long_option(const std::string& name) {
+  if (name.size() < 3 || name.compare(0, 2, "--") != 0) return false;
+  if (!std::isalnum(static_cast<unsigned char>(name[2]))) return false;
+  for (size_t i = 2; i < name.size(); ++i) {
+    const unsigned char ch = static_cast<unsigned char>(name[i]);
+    if (!std::isalnum(ch) && ch != '-' && ch != '_') return false;
+  }
+  return true;
+}
+
+static Options process_args(int argc, char** argv) {
+  if (argc < 9 || std::string(argv[argc - 8]) != "--arg1" ||
+      std::string(argv[argc - 6]) != "--arg2" ||
+      std::string(argv[argc - 4]) != "--arg3" ||
+      std::string(argv[argc - 2]) != "--arg4") {
+    throw std::invalid_argument(
+        "end the command with --arg1 GIB --arg2 HOURS --arg3 GPU_IDS --arg4 FRACTION");
+  }
+
+  Options options;
+  const int tail = argc - 8;
+  bool have_script = false;
+  for (int i = 1; i < tail; i += 2) {
+    const std::string name(argv[i]);
+    if (!is_long_option(name) || name == "--help") {
+      throw std::invalid_argument("expected an option in --name value form: " +
+                                  name);
+    }
+    if (name == "--arg1" || name == "--arg2" ||
+        name == "--arg3" || name == "--arg4") {
+      throw std::invalid_argument(name +
+                                  " must appear exactly once at the end");
+    }
+    if (i + 1 >= tail || std::string(argv[i + 1]).compare(0, 2, "--") == 0) {
+      throw std::invalid_argument("missing value for " + name);
+    }
+    const std::string value(argv[i + 1]);
+    if (name == "--script") {
+      if (have_script || value.empty()) {
+        throw std::invalid_argument("--script requires one nonempty path");
+      }
+      options.script_path = value;
+      have_script = true;
+    } else if (name == "--utilization") {
+      throw std::invalid_argument("--utilization has been replaced by required --arg4");
+    } else {
+      options.script_args.push_back(name);
+      options.script_args.push_back(value);
+    }
+  }
+
+  if (!options.script_args.empty() && !have_script) {
+    throw std::invalid_argument(options.script_args.front() +
+        " is a script argument and requires --script PATH");
+  }
+
+  const double gib = parse_number(argv[tail + 1], "--arg1");
+  const long double bytes =
+      static_cast<long double>(gib) * 1024.0L * 1024.0L * 1024.0L;
+  if (gib <= 0.0 || bytes < 1.0L ||
+      bytes >= static_cast<long double>(std::numeric_limits<size_t>::max())) {
+    throw std::invalid_argument("--arg1 must be a positive, representable GiB size");
+  }
+  options.occupy_size = static_cast<size_t>(bytes);
+
+  const double hours = parse_number(argv[tail + 3], "--arg2");
+  if (hours < 0.0 || hours > std::numeric_limits<float>::max() ||
+      (hours > 0.0 && hours < std::numeric_limits<float>::min())) {
+    throw std::invalid_argument("--arg2 must be nonnegative and representable");
+  }
+  options.total_time = static_cast<float>(hours);
+  options.gpu_ids = parse_gpu_ids(argv[tail + 5], options.all_gpus);
+
+  const double fraction = parse_number(argv[tail + 7], "--arg4");
+  if (fraction <= 0.0 || fraction > 1.0 ||
+      fraction < static_cast<double>(std::numeric_limits<float>::min())) {
+    throw std::invalid_argument("--arg4 must be in (0, 1]");
+  }
+  options.utilization = static_cast<float>(fraction);
+  return options;
+}
+
+static bool help_requested(int argc, char** argv) {
+  if (argc == 1) return true;
+  if (argc == 2 && std::string(argv[1]) == "help") return true;
+  for (int i = 1; i < argc; i += 2) {
+    if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
+      return true;
+    }
+  }
+  return false;
+}
+
+// End of command-line-only code.
+
 
 // ============================================================================
 // Tensor-core occupier kernel
@@ -224,7 +438,20 @@ void run_default_script(char** array, size_t occupy_size, float total_time,
     if (utilization < 1.0f && on_time_ms > 0) {
       double off_time_ms = on_time_ms * (1.0 / utilization - 1.0);
       if (off_time_ms > 0.5) {
-        sleep_ms(off_time_ms);
+        // Sleep in bounded chunks: the original cast to long can overflow
+        // for tiny (but valid) utilization fractions. Check the deadline too.
+        while (off_time_ms > 0.0) {
+          const double elapsed = std::chrono::duration<double>(
+              std::chrono::steady_clock::now() - start_total).count();
+          const double remaining_ms =
+              (static_cast<double>(total_time) * 3600.0 - elapsed) * 1000.0;
+          if (remaining_ms <= 0.0) break;
+          const double chunk_ms =
+              std::min(1000.0, std::min(off_time_ms, remaining_ms));
+          std::this_thread::sleep_for(
+              std::chrono::duration<double, std::milli>(chunk_ms));
+          off_time_ms -= chunk_ms;
+        }
       }
     }
 
@@ -241,92 +468,11 @@ void run_default_script(char** array, size_t occupy_size, float total_time,
       last_log_time = now;
     }
   }
-
-  for (int id : gpu_ids) {
-    cudaFree(array[id]);
-  }
 }
 
-void process_args(int argc, char** argv, size_t& occupy_size, float& total_time,
-                  std::vector<int>& gpu_ids, float& utilization, std::string& script_path) {
-  if (argc != 5 && argc != 6) {
-    printf(
-        "Arguments: <GPU Memory (GB)> <Occupied Time (h)> <GPU ID> <Utilization(0.0-1.0)> <OPTIONAL: "
-        "Script Path>\n");
-    throw std::invalid_argument("Invalid argument number");
-  }
-
-  int gpu_num;
-  CUDA_CHECK(cudaGetDeviceCount(&gpu_num));
-  int id;
-  std::string s(argv[3]);
-  std::replace(s.begin(), s.end(), ',', ' ');
-  std::stringstream ss;
-  ss << s;
-  while (ss >> id) {
-    gpu_ids.push_back(id);
-  }
-
-  if (gpu_ids.size() == 1 && gpu_ids[0] == -1) {
-    gpu_ids[0] = 0;
-    for (int i = 1; i < gpu_num; ++i) {
-      gpu_ids.push_back(i);
-    }
-  }
-
-  for (int i : gpu_ids) {
-    if (i < 0 || i >= gpu_num) {
-      printf("Invalid GPU ID (%d GPU in total): %d\n", gpu_num, i);
-      throw std::invalid_argument("Invalid GPU ID");
-    }
-  }
-
-  float occupy_mem;
-  sscanf(argv[1], "%f", &occupy_mem);
-  sscanf(argv[2], "%f", &total_time);
-  sscanf(argv[4], "%f", &utilization);
-
-  if (occupy_mem <= 0) {
-    printf("GPU memory must be positive: %.2f\n", occupy_mem);
-    throw std::invalid_argument("Invalid GPU memory");
-  }
-  if (total_time < 0) {
-    printf("Occupied time must be non-negative: %.2f\n", total_time);
-    throw std::invalid_argument("Invalid occupied time");
-  }
-  if (utilization <= 0.0f || utilization > 1.0f) {
-    printf("Utilization must be in range (0.0, 1.0]: %.2f\n", utilization);
-    throw std::invalid_argument("Invalid utilization");
-  }
-
-  CUDA_CHECK(cudaSetDevice(gpu_ids[0]));
-  size_t total_size, avail_size;
-  cudaMemGetInfo(&avail_size, &total_size);
-
-  occupy_size = (size_t)(occupy_mem * bytes_per_gb);
-  if (occupy_size > total_size) {
-    printf("GPU memory exceeds maximum (%.2f GB): %.2f\n",
-           total_size / bytes_per_gb, occupy_mem);
-    throw std::invalid_argument("Exceed maximal GPU memory");
-  }
-
-  printf("GPU memory (GB): %.2f\n", occupy_mem);
-  printf("Occupied time (h): %.2f\n", total_time);
-  printf("Target Utilization: %.2f%%\n", utilization * 100);
-
-  if (argc == 5) {
-    printf("GPU ID: ");
-    for (size_t idx = 0; idx < gpu_ids.size(); ++idx) {
-      printf("%d%c", gpu_ids[idx], (idx == gpu_ids.size() - 1) ? '\n' : ',');
-    }
-  } else {
-    script_path = argv[5];
-    printf("Script path: %s\n", script_path.c_str());
-  }
-}
-
-void allocate_mem(char** array, size_t occupy_size, std::vector<int>& gpu_ids) {
-  std::vector<bool> allocated(max_gpu_num, false);
+void allocate_mem(char** array, size_t array_size, size_t occupy_size,
+                  const std::vector<int>& gpu_ids) {
+  std::vector<bool> allocated(array_size, false);
   int cnt = 0;
   while (true) {
     printf("Try allocate GPU memory %d times >>>>>>>>>>>>>>>>>>>>\n", ++cnt);
@@ -336,8 +482,13 @@ void allocate_mem(char** array, size_t occupy_size, std::vector<int>& gpu_ids) {
         CUDA_CHECK(cudaSetDevice(id));
         cudaError_t status = cudaMalloc(&array[id], occupy_size);
         size_t total_size, avail_size;
-        cudaMemGetInfo(&avail_size, &total_size);
+        CUDA_CHECK(cudaMemGetInfo(&avail_size, &total_size));
         if (status != cudaSuccess) {
+          if (status != cudaErrorMemoryAllocation) {
+            CUDA_CHECK(status);
+          }
+          // Clear the handled allocation error before retrying.
+          (void)cudaGetLastError();
           printf(
               "GPU-%d: Failed to allocate %.2f GB GPU memory (%.2f GB "
               "available)\n",
@@ -358,36 +509,129 @@ void allocate_mem(char** array, size_t occupy_size, std::vector<int>& gpu_ids) {
   printf("Successfully allocate memory on all GPUs!\n");
 }
 
-void run_custom_script(char** array, std::vector<int>& gpu_ids,
-                       std::string script_path) {
-  printf("Running custom script >>>>>>>>>>>>>>>>>>>>\n");
-  for (int id : gpu_ids) {
-    cudaFree(array[id]);
+// Validate the real script before waiting for GPU memory.
+static void validate_script_path(const std::string& script_path) {
+  if (script_path.empty()) return;
+  struct stat info;
+  if (stat(script_path.c_str(), &info) != 0) {
+    throw std::invalid_argument("cannot open script: " + script_path +
+                                ": " + std::strerror(errno));
   }
-  std::string cmd = "sh " + script_path;
-  std::system(cmd.c_str());
+  if (!S_ISREG(info.st_mode) || access(script_path.c_str(), R_OK) != 0) {
+    throw std::invalid_argument("script must be a readable regular file: " +
+                                script_path);
+  }
+}
+
+static int initialize_devices(Options& options) {
+  int gpu_num = 0;
+  CUDA_CHECK(cudaGetDeviceCount(&gpu_num));
+  if (gpu_num <= 0) throw std::runtime_error("no CUDA-visible GPU is available");
+  if (options.all_gpus) {
+    for (int id = 0; id < gpu_num; ++id) options.gpu_ids.push_back(id);
+  }
+  for (int id : options.gpu_ids) {
+    if (id < 0 || id >= gpu_num) {
+      throw std::invalid_argument("GPU ID " + std::to_string(id) +
+          " is outside the CUDA-visible range 0.." + std::to_string(gpu_num - 1));
+    }
+    CUDA_CHECK(cudaSetDevice(id));
+    size_t total_size = 0, avail_size = 0;
+    CUDA_CHECK(cudaMemGetInfo(&avail_size, &total_size));
+    if (options.occupy_size > total_size) {
+      throw std::invalid_argument("--arg1 exceeds total memory on GPU " +
+                                  std::to_string(id));
+    }
+    if (options.script_path.empty()) {
+      cudaDeviceProp properties;
+      CUDA_CHECK(cudaGetDeviceProperties(&properties, id));
+      if (properties.major < 7) {
+        throw std::invalid_argument("the built-in Tensor Core kernel requires "
+                                    "compute capability >= 7.0");
+      }
+    }
+  }
+  return gpu_num;
+}
+
+static void release_mem(char** array, const std::vector<int>& gpu_ids) {
+  for (int id : gpu_ids) {
+    if (array[id] != nullptr) {
+      CUDA_CHECK(cudaSetDevice(id));
+      CUDA_CHECK(cudaFree(array[id]));
+      array[id] = nullptr;
+    }
+  }
+}
+
+static void run_custom_script(const Options& options) {
+  // Preserve the original /bin/sh behavior. execv passes literal arguments;
+  // script paths/values containing spaces or shell metacharacters are safe.
+  std::string path = options.script_path;
+  if (!path.empty() && path.front() == '-') path = "./" + path;
+  std::vector<std::string> arguments;
+  arguments.push_back("/bin/sh");
+  arguments.push_back(path);
+  arguments.insert(arguments.end(), options.script_args.begin(),
+                   options.script_args.end());
+  std::vector<char*> argv;
+  for (std::string& value : arguments) {
+    argv.push_back(const_cast<char*>(value.c_str()));
+  }
+  argv.push_back(nullptr);
+  std::cout << "Starting actual script: " << options.script_path
+            << " (GPU reservations released)\n";
+  std::cout.flush();
+  std::cerr.flush();
+  std::fflush(nullptr);
+  execv("/bin/sh", argv.data());
+  throw std::runtime_error(std::string("cannot execute /bin/sh: ") +
+                           std::strerror(errno));
 }
 
 int main(int argc, char** argv) {
-  size_t occupy_size;
-  float total_time;
-  float utilization;
-  std::vector<int> gpu_ids;
-  std::string script_path;
-  char* array[max_gpu_num];
-  memset(array, 0, sizeof(array));
+  if (help_requested(argc, argv)) {
+    print_help(argv[0]);
+    return 0;
+  }
 
+  Options options;
   try {
-    process_args(argc, argv, occupy_size, total_time, gpu_ids, utilization, script_path);
-    allocate_mem(array, occupy_size, gpu_ids);
+    options = process_args(argc, argv);
+    validate_script_path(options.script_path);
+    const int gpu_num = initialize_devices(options);
+    std::vector<char*> array(static_cast<size_t>(gpu_num), nullptr);
 
-    if (argc == 5) {
-      run_default_script(array, occupy_size, total_time, gpu_ids, utilization);
-    } else {
-      run_custom_script(array, gpu_ids, script_path);
+    std::cout << "GrabGPU: "
+              << (options.script_path.empty() ? "Tensor Core workload" :
+                                                  "reservation before real script")
+              << "\nGPU memory per device (GiB): "
+              << options.occupy_size / bytes_per_gb
+              << "\nBuilt-in duration (h): " << options.total_time
+              << "\nBuilt-in target utilization: "
+              << options.utilization * 100.0f << "%\nGPU IDs: ";
+    for (size_t i = 0; i < options.gpu_ids.size(); ++i) {
+      std::cout << (i ? "," : "") << options.gpu_ids[i];
     }
-  } catch (const std::exception& e) {
-    std::cerr << "Error: " << e.what() << std::endl;
+    std::cout << std::endl;
+
+    allocate_mem(array.data(), array.size(), options.occupy_size, options.gpu_ids);
+    if (options.script_path.empty()) {
+      run_default_script(array.data(), options.occupy_size, options.total_time,
+                         options.gpu_ids, options.utilization);
+      release_mem(array.data(), options.gpu_ids);
+    } else {
+      release_mem(array.data(), options.gpu_ids);
+      // Tear down these CUDA contexts before replacing this process.
+      for (int id : options.gpu_ids) {
+        CUDA_CHECK(cudaSetDevice(id));
+        CUDA_CHECK(cudaDeviceReset());
+      }
+      run_custom_script(options);
+    }
+  } catch (const std::exception& error) {
+    std::cerr << "Error: " << error.what()
+              << "\nRun '" << argv[0] << " --help' for usage." << std::endl;
     return 1;
   }
 
